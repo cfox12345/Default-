@@ -45,25 +45,28 @@ p { margin: 0; }
 
 /* ---------- App chrome ---------- */
 .appbar {
-  position: sticky; top: 0; z-index: 20;
+  position: sticky; top: var(--safe-t); z-index: 20;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
-  padding-top: var(--safe-t);
 }
+/* Paints the status-bar band above the sticky header. */
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: var(--safe-t); z-index: 21; background: var(--bg); }
 .appbar-inner {
-  max-width: 640px; margin: 0 auto; height: 48px; padding: 0 16px;
+  max-width: 640px; margin: 0 auto; height: 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
 }
 .brand { display: flex; align-items: center; gap: 8px; color: var(--text); text-decoration: none; font-weight: 650; letter-spacing: 0.01em; }
 .brand-mark { width: 22px; height: 22px; color: var(--accent); }
-.save-status { font-size: 0.8rem; color: var(--muted); opacity: 0; transition: opacity 0.3s; }
+.save-status { font-size: 0.8rem; white-space: nowrap; color: var(--muted); opacity: 0; transition: opacity 0.3s; }
 .save-status.is-visible { opacity: 1; }
 
 .storage-warning { max-width: 640px; margin: 12px auto 0; padding: 10px 16px; background: rgba(240, 122, 122, 0.12); color: var(--danger); font-size: 0.9rem; }
 
 .view {
   max-width: 640px; margin: 0 auto;
-  padding: 16px 16px calc(var(--tabbar-h) + var(--safe-b) + 28px);
+  padding-top: 16px; padding-bottom: calc(var(--tabbar-h) + var(--safe-b) + 28px);
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
   display: flex; flex-direction: column; gap: 14px;
   outline: none;
 }

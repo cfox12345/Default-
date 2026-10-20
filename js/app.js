@@ -5,6 +5,23 @@
   const PLAN = window.SKI_FITNESS_PLAN;
   const STORAGE_KEY = 'skiSeasonFitness.v1';
   const SCHEMA_VERSION = 1;
+  // Hosted on claude.ai: no service worker, no #/ URLs, saves go to the account.
+  const IN_VIEWER = !!(window.claude && typeof window.claude.use === 'function');
+
+  // ---------- Routing ----------
+  // Standalone uses #/path URLs. Inside the claude.ai viewer the hash is not
+  // ours to use, so the current path is kept in memory instead.
+  let memPath = '';
+  function currentPath() { return IN_VIEWER ? memPath : location.hash.replace(/^#\/?/, ''); }
+  function go(path) {
+    if (IN_VIEWER) { memPath = path; render(); }
+    else if (currentPath() === path) render();
+    else location.hash = '#/' + path;
+  }
+  function setPathSilently(path) {
+    if (IN_VIEWER) memPath = path;
+    else history.replaceState(null, '', '#/' + path);
+  }
 
   const NOTE_FIELDS = [
     { key: 'neck', label: 'Neck / traps / scalenes' },
@@ -119,11 +136,18 @@
     }, sess, { notes });
   }
 
+  // Local copy: always kept in this browser. `dirty` lists account documents
+  // still to upload ("meta" or "s_<sessionId>"), so edits made before the
+  // account connects are not lost.
   let storageAvailable = true;
+  let dirty = new Set();
   function loadState() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? normalizeState(JSON.parse(raw)) : emptyState();
+      if (!raw) return emptyState();
+      const parsed = JSON.parse(raw);
+      dirty = new Set(Array.isArray(parsed._dirty) ? parsed._dirty : []);
+      return normalizeState(parsed);
     } catch (e) {
       storageAvailable = false;
       return emptyState();
@@ -136,27 +160,138 @@
     clearTimeout(saveTimer);
     saveTimer = null;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.assign({ _dirty: [...dirty] }, state)));
       storageAvailable = true;
-      flashSaved();
     } catch (e) {
       storageAvailable = false;
-      showToast('Could not save — storage is full or blocked. Export a backup.');
     }
-    document.getElementById('storage-warning').hidden = storageAvailable;
+    pushDirty();
+    if (!storageAvailable && remote.status !== 'synced') showToast('Could not save on this device. Export a backup.');
+    else flashSaved();
+    updateStorageWarning();
   }
   function scheduleSave() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(saveNow, 350);
   }
   function flushSave() { if (saveTimer) saveNow(); }
+  function markDirty(docId) { if (IN_VIEWER) dirty.add(docId); }
+  function markAllDirty() {
+    if (!IN_VIEWER) return;
+    dirty.add('meta');
+    Object.keys(state.sessions).forEach((id) => dirty.add('s_' + id));
+    remote.knownDocs.forEach((id) => dirty.add(id));
+  }
   window.addEventListener('pagehide', flushSave);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSave(); });
+
+  // ---------- Account sync (only when hosted on claude.ai) ----------
+  // Each person's log lives in their own private documents:
+  // data/users/<id>/meta (settings, weigh-ins) and data/users/<id>/s_<sessionId>.
+  const remote = { status: IN_VIEWER ? 'connecting' : 'off', col: null, knownDocs: new Set() };
+  const inflight = {};
+  const again = {};
+
+  function metaDoc() {
+    return { settings: state.settings, bodyWeightLogs: state.bodyWeightLogs, updatedAt: Date.now() };
+  }
+  function pushDirty() {
+    if (!remote.col) return;
+    [...dirty].forEach(pushDoc);
+  }
+  function pushDoc(docId) {
+    if (inflight[docId]) { again[docId] = true; return; }
+    inflight[docId] = true;
+    (async () => {
+      do {
+        again[docId] = false;
+        dirty.delete(docId);
+        const ref = remote.col.doc(docId);
+        if (docId === 'meta') {
+          await ref.set(metaDoc());
+          remote.knownDocs.add(docId);
+        } else {
+          const session = state.sessions[docId.slice(2)];
+          if (session) { await ref.set(JSON.parse(JSON.stringify(session))); remote.knownDocs.add(docId); }
+          else { await ref.delete(); remote.knownDocs.delete(docId); }
+        }
+      } while (again[docId]);
+      if (remote.status === 'error') { remote.status = 'synced'; updateStorageWarning(); }
+    })().catch((e) => {
+      dirty.add(docId);
+      remote.status = 'error';
+      updateStorageWarning();
+      if (e && e.code === 'quota_exceeded') showToast('Account storage is full. Export a backup, then delete old sessions.');
+    }).finally(() => {
+      inflight[docId] = false;
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.assign({ _dirty: [...dirty] }, state))); } catch (e) { /* local copy optional */ }
+    });
+  }
+
+  async function connectAccount() {
+    try {
+      const [db, user] = await Promise.all([window.claude.use('db'), window.claude.use('user')]);
+      const id = user ? await user.id() : null;
+      if (!db || !id) { remote.status = 'local'; updateStorageWarning(); return; }
+      remote.col = db.collection('data/users/' + id);
+      const snap = await remote.col.limit(1000).get();
+      let changed = false;
+      snap.docs.forEach((doc) => {
+        if (!doc.exists) return;
+        remote.knownDocs.add(doc.id);
+        const body = doc.data();
+        if (doc.id === 'meta') {
+          if (!dirty.has('meta')) {
+            const merged = normalizeState({ settings: body.settings, bodyWeightLogs: body.bodyWeightLogs });
+            state.settings = merged.settings;
+            state.bodyWeightLogs = merged.bodyWeightLogs;
+            changed = true;
+          }
+          return;
+        }
+        if (!doc.id.startsWith('s_') || dirty.has(doc.id)) return;
+        const sid = doc.id.slice(2);
+        const local = state.sessions[sid];
+        if (!local || (body.updatedAt || 0) > (local.updatedAt || 0)) {
+          state.sessions[sid] = normalizeSession(JSON.parse(JSON.stringify(body)));
+          changed = true;
+        } else if ((local.updatedAt || 0) > (body.updatedAt || 0)) {
+          dirty.add(doc.id);
+        }
+      });
+      // Anything only on this device goes up to the account.
+      Object.keys(state.sessions).forEach((sid) => { if (!remote.knownDocs.has('s_' + sid)) dirty.add('s_' + sid); });
+      if (!remote.knownDocs.has('meta') && (state.bodyWeightLogs.length || state.settings.weightUnit !== (PLAN.defaultUnit || 'lb'))) dirty.add('meta');
+      remote.status = 'synced';
+      saveNow();
+      if (changed || parseRoute().name !== 'workout') {
+        const y = window.scrollY;
+        render();
+        window.scrollTo(0, y);
+      }
+    } catch (e) {
+      remote.status = 'error';
+    }
+    updateStorageWarning();
+  }
+
+  function updateStorageWarning() {
+    const warn = document.getElementById('storage-warning');
+    if (remote.status === 'error') {
+      warn.textContent = 'Could not reach your Claude account. Entries are kept on this device and will upload on your next change.';
+      warn.hidden = false;
+    } else if (!storageAvailable && remote.status !== 'synced' && remote.status !== 'connecting') {
+      warn.textContent = 'This browser is blocking storage, so entries will not be saved. Try normal (non-private) browsing.';
+      warn.hidden = false;
+    } else {
+      warn.hidden = true;
+    }
+  }
 
   let savedTimer = null;
   function flashSaved() {
     const el = document.getElementById('save-status');
-    el.textContent = 'Saved';
+    el.textContent = remote.status === 'synced' ? 'Saved to your account' : 'Saved';
     el.classList.add('is-visible');
     clearTimeout(savedTimer);
     savedTimer = setTimeout(() => el.classList.remove('is-visible'), 1400);
@@ -235,9 +370,10 @@
   }
   function commit(session) {
     session.updatedAt = Date.now();
+    markDirty('s_' + session.id);
     if (!state.sessions[session.id]) {
       state.sessions[session.id] = session;
-      history.replaceState(null, '', `#/w/${session.workoutId}/${session.id}`);
+      setPathSilently(`w/${session.workoutId}/${session.id}`);
       const reset = document.querySelector('[data-role="reset-workout"]');
       if (reset) reset.hidden = false;
     }
@@ -382,7 +518,7 @@
   }
 
   function parseRoute() {
-    const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+    const parts = currentPath().split('/').filter(Boolean).map(decodeURIComponent);
     if (parts[0] === 'w' && parts[1]) return { name: 'workout', workoutId: parts[1], sessionId: parts[2] || null };
     if (parts[0] === 'history') return { name: 'history' };
     if (parts[0] === 'data') return { name: 'data' };
@@ -407,7 +543,7 @@
       h('p', null, PLAN.intensityNote)));
     view.appendChild(safetyBox(true));
     view.appendChild(h('p', { class: 'fine-print' },
-      'Saved only in this browser on this device. ', h('a', { href: '#/data' }, 'Backup & storage info')));
+      remote.col ? 'Saved privately to your Claude account. ' : 'Saved only in this browser on this device. ', h('a', { href: '#/data' }, 'Backup & storage info')));
   }
 
   function dayCard(w) {
@@ -525,10 +661,11 @@
       });
       if (!ok) return;
       delete state.sessions[session.id];
+      markDirty('s_' + session.id);
       saveNow();
       draft = null;
       showToast('Workout reset');
-      if (location.hash === `#/w/${workout.id}/new`) render(); else location.hash = `#/w/${workout.id}/new`;
+      go(`w/${workout.id}/new`);
     });
     view.appendChild(h('div', { class: 'page-actions' }, resetBtn));
 
@@ -869,6 +1006,7 @@
       const w = parseFloat(weightIn.value.replace(',', '.'));
       if (!(w > 50 && w < 700)) { showToast('Enter a weight, e.g. 178.4'); weightIn.focus(); return; }
       state.bodyWeightLogs.push({ id: uid(), date: dateIn.value || todayISO(), weight: w, unit: state.settings.weightUnit, note: noteIn.value.trim() });
+      markDirty('meta');
       saveNow();
       showToast('Weekly weigh-in saved');
       render();
@@ -891,11 +1029,34 @@
         del.addEventListener('click', async () => {
           if (!(await confirmAction({ title: 'Delete weigh-in?', body: `${fmtDate(b.date)}: ${b.weight} ${b.unit}`, confirmLabel: 'Delete' }))) return;
           state.bodyWeightLogs = state.bodyWeightLogs.filter((x) => x.id !== b.id);
+          markDirty('meta');
           saveNow();
           render();
         });
         return h('li', null, h('span', null, fmtDate(b.date)), h('strong', null, `${b.weight} ${b.unit}`), b.note && h('span', { class: 'muted small' }, b.note), del);
       })));
+  }
+
+  function storageExplanation() {
+    if (remote.status === 'synced' || remote.status === 'error') {
+      return [
+        h('p', null, 'Your log is saved to your Claude account, privately. Only you can see it. Open this page on any phone or computer where you are signed in to Claude and your entries are there.'),
+        h('ul', { class: 'plain-list small' },
+          h('li', null, 'A copy is also kept on this device, so nothing is lost if the connection drops for a moment.'),
+          h('li', null, 'Entries load when you open the page. If you log on two devices at the same time, reopen the page to see the other one’s changes.'),
+          h('li', null, 'Download a backup now and then anyway.')),
+        remote.status === 'error' && h('p', { class: 'small note-callout' }, 'Right now the account can’t be reached. Changes are kept on this device and upload on your next edit.')
+      ];
+    }
+    if (remote.status === 'connecting') return h('p', null, 'Connecting to your Claude account…');
+    return [
+      h('p', null, 'Everything is saved only in this browser on this device. There is no cloud sync, so entries will not appear on other devices or in other browsers.'),
+      h('ul', { class: 'plain-list small' },
+        IN_VIEWER && h('li', null, 'Sign in to Claude to save your log to your account instead.'),
+        !IN_VIEWER && h('li', null, 'On iPhone, the Home Screen app keeps its own storage, separate from Safari tabs. Pick one and use it consistently, or move data with Export / Restore.'),
+        h('li', null, 'Clearing website data erases the log.'),
+        h('li', null, 'Download a backup now and then — especially before changing phones.'))
+    ];
   }
 
   // ----- Data -----
@@ -905,11 +1066,7 @@
     const sessionCount = Object.keys(state.sessions).length;
     view.appendChild(h('section', { class: 'card' },
       h('h2', { class: 'card-title' }, 'Where your log lives'),
-      h('p', null, 'Everything is saved only in this browser on this device. There is no account and no cloud sync, so entries will not appear on other devices or in other browsers.'),
-      h('ul', { class: 'plain-list small' },
-        h('li', null, 'On iPhone, the Home Screen app keeps its own storage, separate from Safari tabs. Pick one and use it consistently, or move data with Export / Restore.'),
-        h('li', null, 'Clearing website data, or deleting the Home Screen app, erases the log.'),
-        h('li', null, 'Export a backup now and then — especially before changing phones.')),
+      storageExplanation(),
       h('p', { class: 'muted small' }, `${sessionCount} session${sessionCount === 1 ? '' : 's'} and ${state.bodyWeightLogs.length} weigh-in${state.bodyWeightLogs.length === 1 ? '' : 's'} stored.`)));
 
     const stamp = todayISO();
@@ -923,8 +1080,12 @@
     jsonBtn.addEventListener('click', () => downloadFile(jsonName, exportJSON(), 'application/json'));
     const csvBtn = h('button', { type: 'button', class: 'btn btn-secondary' }, 'Download sets (CSV)');
     csvBtn.addEventListener('click', () => downloadFile(csvName, exportCSV(), 'text/csv'));
-    btns.append(jsonBtn, csvBtn);
-    if (canShareFiles()) {
+    if (IN_VIEWER && !downloadsApi) {
+      btns.appendChild(h('p', { class: 'small note-callout' }, downloadsChecked ? 'Downloads aren’t available in this view. Open the page in a browser to export.' : 'Checking whether downloads are available…'));
+    } else {
+      btns.append(jsonBtn, csvBtn);
+    }
+    if (!IN_VIEWER && canShareFiles()) {
       const shareBtn = h('button', { type: 'button', class: 'btn btn-secondary' }, 'Share backup…');
       shareBtn.addEventListener('click', () => shareFile(jsonName, exportJSON(), 'application/json'));
       btns.appendChild(shareBtn);
@@ -947,8 +1108,10 @@
         confirmLabel: 'Replace & restore'
       });
       if (!ok) return;
+      markAllDirty();
       state = incoming;
       draft = null;
+      markAllDirty();
       saveNow();
       showToast('Backup restored');
       render();
@@ -964,32 +1127,39 @@
       h('h2', { class: 'card-title' }, 'Units'),
       h('p', { class: 'muted small' }, 'Default unit for new weight entries and weigh-ins. Existing entries keep the unit they were logged in.'),
       segmented({ options: [{ value: 'lb', label: 'Pounds (lb)' }, { value: 'kg', label: 'Kilograms (kg)' }], value: state.settings.weightUnit, label: 'Weight unit',
-        onPick: (v) => { state.settings.weightUnit = v || state.settings.weightUnit; saveNow(); render(); } })));
+        onPick: (v) => { state.settings.weightUnit = v || state.settings.weightUnit; markDirty('meta'); saveNow(); render(); } })));
 
     view.appendChild(h('section', { class: 'card' },
       h('h2', { class: 'card-title' }, 'Add to iPhone Home Screen'),
       h('ol', { class: 'plain-list small numbered' },
-        h('li', null, 'Open this page in Safari.'),
-        h('li', null, 'Tap the Share button, then “Add to Home Screen”.'),
-        h('li', null, 'Open it from the new icon. After the first load it works offline.'))));
+        h('li', null, 'Open this page’s link in Safari.'),
+        h('li', null, 'Tap the Share button (the square with an arrow pointing up), then “Add to Home Screen”.'),
+        h('li', null, IN_VIEWER ? 'Tap the new icon to open your tracker. Stay signed in to Claude in Safari.' : 'Open it from the new icon. After the first load it works offline.'))));
 
-    const clearBtn = h('button', { type: 'button', class: 'btn btn-danger' }, 'Delete all local data');
+    const synced = !!remote.col;
+    const clearBtn = h('button', { type: 'button', class: 'btn btn-danger' }, synced ? 'Delete all my data' : 'Delete all local data');
     clearBtn.addEventListener('click', async () => {
       const ok = await confirmAction({
-        title: 'Delete all local data?',
-        body: 'This permanently erases every session, set, note, rating and weigh-in stored in this browser. Export a backup first if you might want it. This cannot be undone.',
+        title: synced ? 'Delete all my data?' : 'Delete all local data?',
+        body: `This permanently erases every session, set, note, rating and weigh-in ${synced ? 'saved to your account and on this device' : 'stored in this browser'}. Download a backup first if you might want it. This cannot be undone.`,
         confirmLabel: 'Delete everything'
       });
       if (!ok) return;
+      markAllDirty();
       state = emptyState();
       draft = null;
-      try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
-      showToast('All local data deleted');
+      if (synced) {
+        saveNow();
+      } else {
+        dirty.clear();
+        try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+      }
+      showToast('All data deleted');
       render();
     });
     view.appendChild(h('section', { class: 'card' },
       h('h2', { class: 'card-title' }, 'Danger zone'),
-      h('p', { class: 'muted small' }, 'Workout definitions live in data/workouts.js and are not affected.'),
+      h('p', { class: 'muted small' }, 'The workout plan itself is not affected.'),
       clearBtn));
 
     view.appendChild(h('p', { class: 'fine-print' }, 'This tracker is a logging tool, not medical treatment or advice. Follow your clinician and physical therapist.'));
@@ -1038,7 +1208,18 @@
     }
     return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
   }
-  function downloadFile(name, text, type) {
+  async function downloadFile(name, text, type) {
+    if (IN_VIEWER) {
+      if (!downloadsApi) return;
+      try {
+        await downloadsApi.save({ filename: name, data: text });
+        showToast(`Exported ${name}`);
+      } catch (e) {
+        if (e && e.code === 'declined') return;
+        showToast(e && e.code === 'rate_limited' ? 'A save is already open. Try again in a moment.' : 'Export failed. Try again in a browser.');
+      }
+      return;
+    }
     const url = URL.createObjectURL(new Blob([text], { type }));
     const a = h('a', { href: url, download: name, hidden: true });
     document.body.appendChild(a);
@@ -1060,11 +1241,28 @@
   }
 
   // ---------- Boot ----------
-  document.getElementById('storage-warning').hidden = storageAvailable;
-  window.addEventListener('hashchange', render);
+  let downloadsApi = null;
+  let downloadsChecked = false;
+  updateStorageWarning();
+  if (IN_VIEWER) {
+    document.addEventListener('click', (e) => {
+      const a = e.target.closest && e.target.closest('a[href^="#/"]');
+      if (!a) return;
+      e.preventDefault();
+      go(a.getAttribute('href').slice(2));
+    });
+    window.claude.use('downloads').then((d) => {
+      downloadsApi = d;
+      downloadsChecked = true;
+      if (parseRoute().name === 'data') render();
+    });
+    connectAccount();
+  } else {
+    window.addEventListener('hashchange', render);
+  }
   render();
 
-  if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+  if (!IN_VIEWER && 'serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
   }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});

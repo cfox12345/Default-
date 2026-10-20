@@ -10,6 +10,12 @@ A small, mobile-first workout tracker for a conservative return to training befo
 
 This tracker is a logging tool, not medical treatment or advice.
 
+## Hosted version (easiest)
+
+The app is hosted privately on claude.ai: <https://claude.ai/artifact/GnAbioCAEYPVHFrUUZ3fyb>. Open it on the phone while signed in to Claude. There, the log is saved privately to your Claude account, so it is the same on every device. A copy is also kept on the device. That version doesn't work offline.
+
+To update it after editing the plan or code, run `node tools/build-artifact.mjs`. This rebuilds `dist/ski-season-fitness.html`, a single self-contained page, which then gets republished to the same link.
+
 ## Run locally
 
 Any static file server works. From the repo root:
